@@ -1,40 +1,69 @@
 #include <bits/stdc++.h>
 using namespace std;
 
+struct CoreData
+{
+    string name;
+    uint64_t prevIdle;
+    uint64_t prevTotal;
+    uint64_t currIdle;
+    uint64_t currTotal;
+};
+
+void readProcStatData(ifstream &reader, CoreData &coreData)
+{
+    uint64_t user, nice, system, idle, ioWait, irq, softirq, steal;
+    string data, ignoreFirst;
+    getline(reader, data);
+    stringstream ss(data);
+    ss >> ignoreFirst >> user >> nice >> system >> idle >> ioWait >> irq >> softirq >> steal;
+    coreData.currIdle = idle + ioWait;
+    coreData.currTotal = user + nice + system + idle + ioWait + irq + softirq + steal;
+}
+
+void outputCpuUsage(CoreData &coreData)
+{
+    double deltaIdle = coreData.currIdle - coreData.prevIdle;
+    double deltaTotal = coreData.currTotal - coreData.prevTotal;
+    cout << coreData.name << ": " << ((double)(deltaTotal - deltaIdle) / deltaTotal) * 100 << " ";
+    coreData.prevTotal = coreData.currTotal;
+    coreData.prevIdle = coreData.currIdle;
+}
+
 int main()
 {
     string filename = "/proc/stat";
     string data;
-    double prevIdle = 0;
-    double prevTotal = 0;
-    cout << "CPU Utilization:" << "\n";
+    cout << "CPU Utilization (%):" << "\n";
     ifstream FileReader(filename);
     cout << std::setprecision(2) << std::fixed;
+    vector<CoreData> coreDataArr;
+    string name;
+    uint64_t user, nice, system, idle, ioWait, irq, softirq, steal;
+    while (getline(FileReader, data))
+    {
+        stringstream ss(data);
+        ss >> name >> user >> nice >> system >> idle >> ioWait >> irq >> softirq >> steal;
+        if (name.find("cpu") == string::npos)
+            break;
+        CoreData coreData;
+        coreData.name = name;
+        coreData.prevIdle = idle + ioWait;
+        coreData.prevTotal = user + nice + system + idle + ioWait + irq + softirq + steal;
+        coreDataArr.push_back(coreData);
+    }
+    sleep(1);
+
     while (1)
     {
+        FileReader.clear();
         FileReader.seekg(0);
-        double currUser = 0;
-        double currNice = 0;
-        double currSystem = 0;
-        double currIdle = 0;
-        double currIoWait = 0;
-        double currIrq = 0;
-        double currSoftirq = 0;
-        double currSteal = 0;
-        string first;
-        while (getline(FileReader, data))
+        for (auto &coreData : coreDataArr)
         {
-            stringstream ss(data);
-            ss >> first >> currUser >> currNice >> currSystem >> currIdle >> currIoWait >> currIrq >> currSoftirq >> currSteal;
-            break;
+            readProcStatData(FileReader, coreData);
+            outputCpuUsage(coreData);
         }
-        double currTotalIdeal = currIdle + currIoWait;
-        double currTotal = currUser + currNice + currSystem + currIdle + currIoWait + currIrq + currSoftirq + currSteal;
-        double deltaIdle = currTotalIdeal - prevIdle;
-        double deltaTotal = currTotal - prevTotal;
-        cout << ((deltaTotal - deltaIdle) / deltaTotal) * 100 << "\n";
-        prevIdle = currTotalIdeal;
-        prevTotal = currTotal;
-        sleep(1);
+        cout << "\n";
+        sleep(0.5);
     }
 }
