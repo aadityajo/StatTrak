@@ -25,7 +25,11 @@ void outputCpuUsage(CoreData &coreData)
 {
     double deltaIdle = coreData.currIdle - coreData.prevIdle;
     double deltaTotal = coreData.currTotal - coreData.prevTotal;
-    cout << coreData.name << ": " << ((double)(deltaTotal - deltaIdle) / deltaTotal) * 100 << " ";
+    cout << coreData.name << ": ";
+    if (deltaTotal > 0)
+        cout << ((double)(deltaTotal - deltaIdle) / deltaTotal) * 100 << " ";
+    else
+        cout << 0.0 << " ";
     coreData.prevTotal = coreData.currTotal;
     coreData.prevIdle = coreData.currIdle;
 }
@@ -34,13 +38,20 @@ int main()
 {
     string filename = "/proc/stat";
     string data;
+    ifstream fileReader(filename);
+
+    if (!fileReader.is_open())
+    {
+        cout << "Failed to open /proc/stat" << "\n";
+        return 1;
+    }
+
     cout << "CPU Utilization (%):" << "\n";
-    ifstream FileReader(filename);
     cout << std::setprecision(2) << std::fixed;
     vector<CoreData> coreDataArr;
     string name;
     uint64_t user, nice, system, idle, ioWait, irq, softirq, steal;
-    while (getline(FileReader, data))
+    while (getline(fileReader, data))
     {
         stringstream ss(data);
         ss >> name >> user >> nice >> system >> idle >> ioWait >> irq >> softirq >> steal;
@@ -56,14 +67,13 @@ int main()
 
     while (1)
     {
-        FileReader.clear();
-        FileReader.seekg(0);
+        fileReader.seekg(0);
         for (auto &coreData : coreDataArr)
         {
-            readProcStatData(FileReader, coreData);
+            readProcStatData(fileReader, coreData);
             outputCpuUsage(coreData);
         }
         cout << "\n";
-        sleep(0.5);
+        sleep(1);
     }
 }
