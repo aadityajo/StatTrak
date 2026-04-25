@@ -15,7 +15,7 @@
 #include <atomic>
 #include <mutex>
 
-std::mutex shutdownMutex, metricExporterQueueMutex;
+std::mutex shutdownMutex, metricDataQueueMutex;
 std::condition_variable shutdownCV;
 std::condition_variable metricQueueCV;
 std::atomic<bool> shutdownRequested = false;
@@ -30,19 +30,19 @@ struct CoreData
     double cpuUsage;
 };
 
-struct MetricExporter
+struct MetricData
 {
     std::string name;
     double val;
 
-    MetricExporter(std::string name, double val)
+    MetricData(std::string name, double val)
     {
         this->name = name;
         this->val = val;
     };
 };
 
-std::queue<MetricExporter> metricExporterQ;
+std::queue<MetricData> metricDataQ;
 
 void shutdownHelper()
 {
@@ -79,8 +79,8 @@ void calculateCpuUsage(CoreData &coreData)
 
 void pushCpuUsage(CoreData &coreData)
 {
-    std::lock_guard<std::mutex> lock(metricExporterQueueMutex);
-    metricExporterQ.push(MetricExporter(coreData.name, coreData.cpuUsage));
+    std::lock_guard<std::mutex> lock(metricDataQueueMutex);
+    metricDataQ.push(MetricData(coreData.name, coreData.cpuUsage));
 }
 
 void runStatTrackCPU()
@@ -143,25 +143,25 @@ void runStatTrackCPU()
 
 void runStatTrackExporter()
 {
-    std::unique_lock<std::mutex> metricExporterQueueLock{metricExporterQueueMutex, std::defer_lock};
+    std::unique_lock<std::mutex> metricDataQueueLock{metricDataQueueMutex, std::defer_lock};
     while (!shutdownRequested.load())
     {
-        metricExporterQueueLock.lock();
-        if (!metricExporterQ.empty())
+        metricDataQueueLock.lock();
+        if (!metricDataQ.empty())
         {
-            while (!metricExporterQ.empty())
+            while (!metricDataQ.empty())
             {
-                MetricExporter &curr = metricExporterQ.front();
+                MetricData &curr = metricDataQ.front();
                 std::cout << curr.name << " " << curr.val << " ";
-                metricExporterQ.pop();
+                metricDataQ.pop();
             }
             std::cout << "\n";
         }
-        metricExporterQueueLock.unlock();
+        metricDataQueueLock.unlock();
         {
             std::unique_lock<std::mutex> lock{shutdownMutex};
             metricQueueCV.wait_for(lock, std::chrono::seconds(1), []
-                                   { return shutdownRequested.load() || !metricExporterQ.empty(); });
+                                   { return shutdownRequested.load() || !metricDataQ.empty(); });
         }
     }
 }
