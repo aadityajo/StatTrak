@@ -1,16 +1,27 @@
 #include <iostream>
+#include <queue>
+#include <condition_variable>
 #include <fstream>
+#include <pthread.h>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <iomanip>
 #include <unistd.h>
 #include <cstdint>
-using namespace std;
+#include <csignal>
+#include <cstdlib>
+#include <atomic>
+#include <mutex>
+
+std::mutex shutdownMutex, metricExporterQueueMutex;
+std::condition_variable cv;
+std::atomic<bool> shutdownRequested = false;
 
 struct CoreData
 {
-    string name;
+    std::string name;
     uint64_t prevIdle;
     uint64_t prevTotal;
     uint64_t currIdle;
@@ -18,10 +29,30 @@ struct CoreData
     double cpuUsage;
 };
 
-bool readProcStatData(stringstream &ss, CoreData &coreData)
+struct MetricExporter
+{
+    std::string name;
+    double val;
+
+    MetricExporter(std::string name, double val)
+    {
+        this->name = name;
+        this->val = val;
+    };
+};
+
+std::queue<MetricExporter> metricExporterQ;
+
+void shutdownHelper()
+{
+    shutdownRequested.store(true);
+    cv.notify_all();
+}
+
+bool readProcStatData(std::stringstream &ss, CoreData &coreData)
 {
     uint64_t user = 0, nice = 0, system = 0, idle = 0, ioWait = 0, irq = 0, softirq = 0, steal = 0;
-    string ignoreFirst;
+    std::string ignoreFirst;
     if (!(ss >> ignoreFirst >> user >> nice >> system >> idle))
     {
         return 0;
@@ -44,33 +75,32 @@ void calculateCpuUsage(CoreData &coreData)
     coreData.prevIdle = coreData.currIdle;
 }
 
-void outputCpuUsage(CoreData &coreData)
+void pushCpuUsage(CoreData &coreData)
 {
-    cout << coreData.name << ": " << coreData.cpuUsage << " ";
+    std::lock_guard<std::mutex> lock(metricExporterQueueMutex);
+    metricExporterQ.push(MetricExporter(coreData.name, coreData.cpuUsage));
 }
 
-int main()
+void runStatTrackCPU()
 {
-    string filename = "/proc/stat";
-    string data;
-    ifstream fileReader(filename);
+    std::string filename = "/proc/stat";
+    std::string data;
+    std::ifstream fileReader(filename);
 
     if (!fileReader.is_open())
     {
-        cout << "Failed to open /proc/stat" << "\n";
-        return 1;
+        shutdownHelper();
+        return;
     }
 
-    cout << "CPU Utilization (%):" << "\n";
-    cout << std::setprecision(2) << std::fixed;
-    vector<CoreData> coreDataArr;
-    string name;
+    std::vector<CoreData> coreDataArr;
+    std::string name;
     uint64_t user, nice, system, idle, ioWait, irq, softirq, steal;
     while (getline(fileReader, data))
     {
-        stringstream ss(data);
+        std::stringstream ss(data);
         ss >> name >> user >> nice >> system >> idle >> ioWait >> irq >> softirq >> steal;
-        if (name.find("cpu") == string::npos)
+        if (name.find("cpu") == std::string::npos)
             break;
         CoreData coreData;
         coreData.name = name;
@@ -78,26 +108,78 @@ int main()
         coreData.prevTotal = user + nice + system + idle + ioWait + irq + softirq + steal;
         coreDataArr.push_back(coreData);
     }
-    sleep(1);
+    {
+        std::unique_lock<std::mutex> lock{shutdownMutex};
+        cv.wait_for(lock, std::chrono::seconds(1), []
+                    { return shutdownRequested.load(); });
+    }
 
-    while (1)
+    while (!shutdownRequested.load())
     {
         fileReader.seekg(0);
         for (auto &coreData : coreDataArr)
         {
             getline(fileReader, data);
-            stringstream ss(data);
+            std::stringstream ss(data);
             if (readProcStatData(ss, coreData))
             {
                 calculateCpuUsage(coreData);
-                outputCpuUsage(coreData);
-            }
-            else
-            {
-                cout << "ERR: " << coreData.name << " ";
+                pushCpuUsage(coreData);
             }
         }
-        cout << "\n";
-        sleep(1);
+        {
+            std::unique_lock<std::mutex> lock{shutdownMutex};
+            cv.wait_for(lock, std::chrono::seconds(1), []
+                        { return shutdownRequested.load(); });
+        }
     }
+}
+
+void runStatTrackExporter()
+{
+    std::unique_lock<std::mutex> metricExporterQueueLock{metricExporterQueueMutex, std::defer_lock};
+    while (!shutdownRequested.load())
+    {
+        metricExporterQueueLock.lock();
+        if (!metricExporterQ.empty())
+        {
+            while (!metricExporterQ.empty())
+            {
+                MetricExporter &curr = metricExporterQ.front();
+                std::cout << curr.name << " " << curr.val << "\n";
+                metricExporterQ.pop();
+            }
+        }
+        metricExporterQueueLock.unlock();
+        {
+            std::unique_lock<std::mutex> lock{shutdownMutex};
+            cv.wait_for(lock, std::chrono::seconds(1), []
+                        { return shutdownRequested.load(); });
+        }
+    }
+}
+
+int main()
+{
+    // Ref : https://thomastrapp.com/blog/signal-handlers-for-multithreaded-cpp/
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGINT);
+    sigaddset(&sigset, SIGTERM);
+
+    pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
+    std::cout << std::setprecision(2) << std::fixed;
+    std::thread signal_thread([&]
+                              {
+        int signum;
+        sigwait(&sigset, &signum); 
+        shutdownHelper(); });
+
+    std::thread cpuReaderThread(runStatTrackCPU);
+    std::thread exporterThread(runStatTrackExporter);
+
+    cpuReaderThread.join();
+    exporterThread.join();
+    signal_thread.join();
+    std::cout << "\nExited" << "\n";
 }
