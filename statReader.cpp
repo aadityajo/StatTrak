@@ -16,7 +16,8 @@
 #include <mutex>
 
 std::mutex shutdownMutex, metricExporterQueueMutex;
-std::condition_variable cv;
+std::condition_variable shutdownCV;
+std::condition_variable metricQueueCV;
 std::atomic<bool> shutdownRequested = false;
 
 struct CoreData
@@ -46,7 +47,8 @@ std::queue<MetricExporter> metricExporterQ;
 void shutdownHelper()
 {
     shutdownRequested.store(true);
-    cv.notify_all();
+    shutdownCV.notify_all();
+    metricQueueCV.notify_all();
 }
 
 bool readProcStatData(std::stringstream &ss, CoreData &coreData)
@@ -108,15 +110,16 @@ void runStatTrackCPU()
         coreData.prevTotal = user + nice + system + idle + ioWait + irq + softirq + steal;
         coreDataArr.push_back(coreData);
     }
+    fileReader.close();
     {
         std::unique_lock<std::mutex> lock{shutdownMutex};
-        cv.wait_for(lock, std::chrono::seconds(1), []
-                    { return shutdownRequested.load(); });
+        shutdownCV.wait_for(lock, std::chrono::seconds(1), []
+                            { return shutdownRequested.load(); });
     }
 
     while (!shutdownRequested.load())
     {
-        fileReader.seekg(0);
+        fileReader.open(filename);
         for (auto &coreData : coreDataArr)
         {
             getline(fileReader, data);
@@ -127,11 +130,14 @@ void runStatTrackCPU()
                 pushCpuUsage(coreData);
             }
         }
+        metricQueueCV.notify_one();
         {
             std::unique_lock<std::mutex> lock{shutdownMutex};
-            cv.wait_for(lock, std::chrono::seconds(1), []
-                        { return shutdownRequested.load(); });
+            shutdownCV.wait_for(lock, std::chrono::seconds(1), []
+                                { return shutdownRequested.load(); });
         }
+
+        fileReader.close();
     }
 }
 
@@ -146,15 +152,16 @@ void runStatTrackExporter()
             while (!metricExporterQ.empty())
             {
                 MetricExporter &curr = metricExporterQ.front();
-                std::cout << curr.name << " " << curr.val << "\n";
+                std::cout << curr.name << " " << curr.val << " ";
                 metricExporterQ.pop();
             }
+            std::cout << "\n";
         }
         metricExporterQueueLock.unlock();
         {
             std::unique_lock<std::mutex> lock{shutdownMutex};
-            cv.wait_for(lock, std::chrono::seconds(1), []
-                        { return shutdownRequested.load(); });
+            metricQueueCV.wait_for(lock, std::chrono::seconds(1), []
+                                   { return shutdownRequested.load() || !metricExporterQ.empty(); });
         }
     }
 }
