@@ -35,11 +35,7 @@ struct MetricData
     std::string name;
     double val;
 
-    MetricData(std::string name, double val)
-    {
-        this->name = name;
-        this->val = val;
-    };
+    MetricData(std::string name, double v) : name(std::move(name)), val(v) {};
 };
 
 std::queue<MetricData> metricDataQ;
@@ -81,6 +77,12 @@ void pushCpuUsage(CoreData &coreData)
 {
     std::lock_guard<std::mutex> lock(metricDataQueueMutex);
     metricDataQ.push(MetricData(coreData.name, coreData.cpuUsage));
+}
+
+void pushMemoryUsage(MetricData &data)
+{
+    std::lock_guard<std::mutex> lock(metricDataQueueMutex);
+    metricDataQ.push(data);
 }
 
 void runStatTrackCPU()
@@ -141,12 +143,52 @@ void runStatTrackCPU()
     }
 }
 
-void runStatTrackExporter()
+void runStatTrackMemory()
 {
-    std::unique_lock<std::mutex> metricDataQueueLock{metricDataQueueMutex, std::defer_lock};
+    std::string filename = "/proc/meminfo";
+    std::string data;
+    std::ifstream fileReader(filename);
+    std::string name;
+    int64_t val;
+
+    if (!fileReader.is_open())
+    {
+        shutdownHelper();
+        return;
+    }
+    fileReader.close();
     while (!shutdownRequested.load())
     {
-        metricDataQueueLock.lock();
+        fileReader.open(filename);
+        std::stringstream ss;
+        std::getline(fileReader, data);
+        ss << data;
+        ss >> name >> val;
+        name.pop_back();
+        MetricData metricData = MetricData(name, val);
+        pushMemoryUsage(metricData);
+        std::getline(fileReader, data);
+        ss.str("");
+        ss << data;
+        ss >> name >> val;
+        name.pop_back();
+        metricData = MetricData(name, val);
+        pushMemoryUsage(metricData);
+        fileReader.close();
+        metricQueueCV.notify_one();
+        {
+            std::unique_lock<std::mutex> lock(shutdownMutex);
+            shutdownCV.wait_for(lock, std::chrono::seconds(1), []
+                                { return shutdownRequested.load(); });
+        }
+    }
+}
+
+void runStatTrackExporter()
+{
+    std::unique_lock<std::mutex> metricDataQueueLock{metricDataQueueMutex};
+    while (!shutdownRequested.load())
+    {
         if (!metricDataQ.empty())
         {
             while (!metricDataQ.empty())
@@ -157,12 +199,8 @@ void runStatTrackExporter()
             }
             std::cout << "\n";
         }
-        metricDataQueueLock.unlock();
-        {
-            std::unique_lock<std::mutex> lock{shutdownMutex};
-            metricQueueCV.wait_for(lock, std::chrono::seconds(1), []
-                                   { return shutdownRequested.load() || !metricDataQ.empty(); });
-        }
+        metricQueueCV.wait_for(metricDataQueueLock, std::chrono::seconds(1), []
+                               { return shutdownRequested.load() || !metricDataQ.empty(); });
     }
 }
 
@@ -182,10 +220,13 @@ int main()
         sigwait(&sigset, &signum); 
         shutdownHelper(); });
 
+    // runStatTrackMemory();
     std::thread cpuReaderThread(runStatTrackCPU);
     std::thread exporterThread(runStatTrackExporter);
+    std::thread memReaderThread(runStatTrackMemory);
 
     cpuReaderThread.join();
+    memReaderThread.join();
     exporterThread.join();
     signal_thread.join();
     std::cout << "\nExited" << "\n";
